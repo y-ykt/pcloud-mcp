@@ -1,0 +1,49 @@
+# © 2026 Yasuhiko Yokote
+
+name: pcloud-mcp
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Anthropic custom connector (remote MCP server) that reads the unencrypted area of pCloud
+
+config:
+  pcloud-mcp:pcloudApiHost:
+    description: pCloud API endpoint. https://api.pcloud.com for the US, https://eapi.pcloud.com for Europe
+    default: https://api.pcloud.com
+  pcloud-mcp:claudeEgressCidr:
+    description: Source IP ranges allowed to call the server, checked inside the Lambda. Separate several ranges with commas
+    default: 160.79.104.0/21
+  pcloud-mcp:callbackUrl:
+    description: Callback URL registered in Cognito as an exact match
+    default: https://claude.ai/api/mcp/auth_callback
+  pcloud-mcp:logRetentionDays:
+    description: Retention of CloudWatch Logs in days
+    default: "30"
+  pcloud-mcp:throttleRate:
+    description: Maximum number of calls per second
+    default: "1"
+  pcloud-mcp:throttleBurst:
+    description: Number of calls allowed in a burst
+    default: "5"
+  pcloud-mcp:cognitoDomainPrefix:
+    description: Domain prefix of the Cognito hosted UI. When omitted, it is built from the account ID
+    default: ""
+  pcloud-mcp:tokenSetAt:
+    description: Time at which the pCloud token was last re-registered. Changing it recreates the Lambda execution environment
+    default: initial
+  pcloud-mcp:downloadMaxBytes:
+    description: Largest non-text file that read_file fetches (bytes). Also limits a single file read by the git tools
+    default: "1048576"
+  pcloud-mcp:forbiddenNames:
+    description: Names of folders that are never entered, wherever they appear in a path, separated by commas. Empty means nothing is excluded
+    default: ""
+  pcloud-mcp:gitRoot:
+    description: Folder on pCloud that holds the encrypted bare repositories read by the git tools. Empty disables the git tools and creates nothing for them
+    default: ""
+  pcloud-mcp:logLevel:
+    description: Log verbosity. debug / info / warn / error. debug also logs the tools/call arguments and the breakdown
+    default: info
+  pcloud-mcp:logResponseBody:
+    description: For investigation. When true, the returned body itself (including file contents) is logged. Set it back to false when done
+    default: "false"

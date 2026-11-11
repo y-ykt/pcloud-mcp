@@ -1,0 +1,33 @@
+# © 2026 Yasuhiko Yokote
+
+# Copy to Pulumi.prod.yaml and adjust. Pulumi.prod.yaml itself is not tracked.
+# `pulumi stack init prod` adds `encryptionsalt` to your copy.
+#
+# This is the only configuration file. Pulumi reads the deployment settings;
+# the scripts in bin/ read the "local paths" below from the same file.
+config:
+  # ---- deployment (read by Pulumi; see Pulumi.yaml for every key and default)
+  aws:region: us-east-1
+  pcloud-mcp:alertEmail: you@example.com
+  # Folder that holds encrypted bare git repositories. The git tools are off unless this is set;
+  # see "The git tools" in README.md before turning them on.
+  # pcloud-mcp:gitRoot: /git-repository
+  # Names of folders that are never entered, wherever they appear in a path, separated by commas.
+  # Leave it out to exclude nothing.
+  # pcloud-mcp:forbiddenNames: private,Crypto Folder
+  pcloud-mcp:downloadMaxBytes: "8388608"
+  pcloud-mcp:logLevel: info
+  pcloud-mcp:logResponseBody: "false"
+
+  # ---- local paths (read by bin/set-pcloud-token and bin/set-git-encrypt-key)
+  # File holding the pCloud access token.
+  pcloud-mcp:pcloudTokenFile: ~/.pcloud-access-token
+  # Directory of a tool that issues the token (it must provide cmd/oauth2-acquire).
+  # Leave it out if you obtain the token by other means; see "Replace the pCloud token" in README.md.
+  # pcloud-mcp:oauthToolDir: ~/src/oauth-tool
+
+  # ---- needed only when the git tools are on (gitRoot is set)
+  # File holding the AES-256-GCM key of the repositories (64 hex characters).
+  # pcloud-mcp:gitKeyFile: ~/.config/pcloud-mcp/git-encrypt.key
+  # A repository under gitRoot whose HEAD is decrypted to verify the key.
+  # pcloud-mcp:gitVerifyRepo: example.git

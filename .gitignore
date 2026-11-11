@@ -1,0 +1,11 @@
+# Dependencies and build output
+node_modules/
+server/dist/
+server/.bundle/
+
+# Local stack configuration (copy Pulumi.prod.yaml.example to create it)
+infra/Pulumi.*.yaml
+!infra/Pulumi.*.yaml.example
+
+# macOS
+.DS_Store

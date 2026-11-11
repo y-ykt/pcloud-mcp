@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# © 2026 Yasuhiko Yokote
+#
+# Reissues the pCloud access token, registers it in Secrets Manager, and
+# replaces the Lambda execution environment.
+#
+#   bin/set-pcloud-token              reissue, then register
+#   bin/set-pcloud-token --reuse      register the value in the existing file as is
+#   bin/set-pcloud-token --no-deploy  register only; do not replace the Lambda
+#
+# The token is never shown on screen or left in the shell history.
+# Temporary files are created readable only by the owner and are always removed on exit.
+#
+# Always verify before registering.
+#   - It is not JSON (prevents wrapping it twice)
+#   - pCloud accepts it (userinfo returns result=0)
+
+set -euo pipefail
+umask 077
+
+readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly INFRA="${HERE}/../infra"
+. "${HERE}/_config.sh"
+
+# An environment variable, when set, wins over the stack configuration file.
+readonly ACQUIRE_DIR="$(expand_home "${PCLOUD_OAUTH_TOOL_DIR:-$(cfg oauthToolDir)}")"
+readonly TOKEN_FILE="$(expand_home "${PCLOUD_TOKEN_FILE:-$(cfg pcloudTokenFile "${HOME}/.pcloud-access-token")}")"
+# The region comes from the stack configuration first (see stack_region)
+readonly REGION="$(stack_region)"
+readonly API_HOST="$(api_host)"
+
+export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE-}"
+
+reuse=false
+deploy=true
+for arg in "$@"; do
+  case "$arg" in
+    --reuse) reuse=true ;;
+    --no-deploy) deploy=false ;;
+    -h|--help) sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo; echo "==> $*"; }
+
+for cmd in aws curl python3; do
+  command -v "$cmd" >/dev/null || die "$cmd not found"
+done
+
+[ -n "$REGION" ] || die "region not configured: set aws:region in ${STACK_FILE} (or AWS_REGION)"
+
+# Temporary directory. Always removed on exit.
+readonly TMP="$(mktemp -d)"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------- 1. Reissue
+
+if [ "$reuse" = true ]; then
+  step "Using the existing file: ${TOKEN_FILE}"
+  [ -f "$TOKEN_FILE" ] || die "file not found: ${TOKEN_FILE}"
+  cp "$TOKEN_FILE" "${TMP}/token"
+else
+  step "Reissuing the pCloud token"
+  command -v go >/dev/null || die "go not found (needed to run the token tool)"
+  [ -n "$ACQUIRE_DIR" ] || die "token tool not configured: set pcloud-mcp:oauthToolDir in ${STACK_FILE} (or PCLOUD_OAUTH_TOOL_DIR), or pass --reuse to register the token already in ${TOKEN_FILE}"
+  [ -d "$ACQUIRE_DIR" ] || die "token tool not found: ${ACQUIRE_DIR}"
+  echo "    Approve in the browser, then paste the code it shows."
+  ( cd "$ACQUIRE_DIR" && go run ./cmd/oauth2-acquire ) > "${TMP}/token"
+  # Keep a local copy for next time
+  cp "${TMP}/token" "$TOKEN_FILE"
+  echo "    Updated ${TOKEN_FILE}"
+fi
+
+# Strip leading and trailing whitespace and newlines
+python3 - "$TMP" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "token"
+p.write_text(p.read_text().strip(), encoding="utf-8")
+PY
+
+# ---------------------------------------------------------------- 2. Verify
+
+step "Verifying the token"
+
+python3 - "$TMP" <<'PY'
+import pathlib, sys
+t = (pathlib.Path(sys.argv[1]) / "token").read_text()
+if not t:
+    sys.exit("empty")
+# Prevents wrapping it twice. The value must be the token itself
+if t.lstrip().startswith("{"):
+    sys.exit("the value is JSON. Pass the token itself")
+if any(c.isspace() for c in t):
+    sys.exit("contains whitespace")
+if not (20 <= len(t) <= 200):
+    sys.exit(f"unexpected length ({len(t)} characters)")
+print(f"    Format: valid ({len(t)} characters)")
+PY
+
+# Check that pCloud actually accepts it. The token is passed from a file, not held in a variable
+curl -s -G "${API_HOST}/userinfo" \
+  --data-urlencode "access_token@${TMP}/token" -o "${TMP}/userinfo.json"
+
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = json.loads((pathlib.Path(sys.argv[1]) / "userinfo.json").read_text())
+if d.get("result") != 0:
+    sys.exit(f"pCloud rejected the token: result={d.get('result')} {d.get('error','')}")
+used = d.get("usedquota", 0) / 2**30
+print(f"    pCloud: accepted ({used:.1f} GiB used / encryption {d.get('cryptosetup')})")
+PY
+
+# ---------------------------------------------------------------- 3. Register
+
+step "Registering in Secrets Manager"
+
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+(d / "secret.json").write_text(json.dumps({"access_token": (d / "token").read_text()}))
+PY
+
+secret_name="$( cd "$INFRA" && pulumi stack output --stack "$STACK" pcloudSecretName 2>/dev/null || echo "pcloud-mcp-${STACK}/pcloud-token" )"
+version="$(aws secretsmanager put-secret-value --region "$REGION" \
+  --secret-id "$secret_name" \
+  --secret-string "file://${TMP}/secret.json" \
+  --query VersionId --output text)"
+echo "    Registered in ${secret_name} (version ${version})"
+
+# Read the registered value back and check that it has the intended form
+aws secretsmanager get-secret-value --region "$REGION" --secret-id "$secret_name" \
+  --query SecretString --output text > "${TMP}/stored.json"
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+stored = json.loads((d / "stored.json").read_text())["access_token"]
+if stored != (d / "token").read_text():
+    sys.exit("the registered value does not match the original")
+print("    Read it back and confirmed that it matches")
+PY
+
+# ---------------------------------------------------------------- 4. Apply
+
+if [ "$deploy" = false ]; then
+  echo
+  echo "The Lambda was not replaced. To apply, run pulumi up in infra."
+  exit 0
+fi
+
+step "Replacing the Lambda execution environment"
+echo "    An execution environment holds the token for as long as it lives, so it has to be recreated"
+
+command -v pulumi >/dev/null || die "pulumi not found (use --no-deploy to register only)"
+cd "$INFRA"
+# Not a secret, so store it as plaintext. Without --plaintext, Pulumi refuses it based on a guess
+pulumi config set --stack "$STACK" --plaintext tokenSetAt "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+deploy_stack "token" || exit 1
+
+echo
+echo "Done."

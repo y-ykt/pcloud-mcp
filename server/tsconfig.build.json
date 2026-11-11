@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": false,
+
+    // Rewrites imports that carry the `.ts` extension to `.js` on output.
+    // The sources run as they are under Node's type stripping, and the output is in a form that runs on Lambda.
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src/**/*.ts"]
+}

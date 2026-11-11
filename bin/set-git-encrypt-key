@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# © 2026 Yasuhiko Yokote
+#
+# Registers the key that decrypts the repositories under gitRoot in Secrets Manager and
+# replaces the Lambda execution environment.
+#
+#   bin/set-git-encrypt-key               register
+#   bin/set-git-encrypt-key --no-deploy   register only; do not replace the Lambda
+#
+# The key is the one that encrypts the repositories under gitRoot. It is read from the
+# file named by pcloud-mcp:gitKeyFile in infra/Pulumi.<stack>.yaml (64 hex characters).
+# The key is never shown on screen, left in the shell history, or passed as a command argument.
+# Temporary files are created readable only by the owner and are always removed on exit.
+#
+# Always verify before registering.
+#   - It is 64 hex characters (= 32 bytes, AES-256)
+#   - It decrypts a real file (fetches a HEAD from pCloud and checks that the
+#     AES-256-GCM authentication tag verifies; the decrypted content is not shown)
+
+set -euo pipefail
+umask 077
+
+readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly INFRA="${HERE}/../infra"
+. "${HERE}/_config.sh"
+
+# An environment variable, when set, wins over the stack configuration file.
+readonly KEY_FILE="$(expand_home "${GIT_ENCRYPT_KEY_FILE:-$(cfg gitKeyFile)}")"
+readonly TOKEN_FILE="$(expand_home "${PCLOUD_TOKEN_FILE:-$(cfg pcloudTokenFile "${HOME}/.pcloud-access-token")}")"
+# Empty when the git tools are disabled. There is no default folder
+readonly GIT_ROOT_DIR="$(cfg gitRoot)"
+readonly VERIFY_REPO="$(cfg gitVerifyRepo)"
+readonly VERIFY_PATH="${GIT_VERIFY_PATH:-${VERIFY_REPO:+$(repo_head_path "$GIT_ROOT_DIR" "$VERIFY_REPO")}}"
+# The region comes from the stack configuration first (see stack_region)
+readonly REGION="$(stack_region)"
+readonly API_HOST="$(api_host)"
+
+export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE-}"
+
+deploy=true
+for arg in "$@"; do
+  case "$arg" in
+    --no-deploy) deploy=false ;;
+    -h|--help) sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo; echo "==> $*"; }
+
+# With no folder named, the git tools are disabled: the server has no secret for the key
+# and would not read one. Stop before anything is fetched or registered
+if [ -z "$GIT_ROOT_DIR" ]; then
+  echo "The git tools are disabled: pcloud-mcp:gitRoot is not set in ${STACK_FILE}." >&2
+  echo "There is no key to register. To enable them, set gitRoot, run \"pulumi up\", then run this again." >&2
+  exit 1
+fi
+
+for cmd in aws curl python3 node; do
+  command -v "$cmd" >/dev/null || die "$cmd not found"
+done
+
+[ -n "$KEY_FILE" ] || die "key file not configured: set pcloud-mcp:gitKeyFile in ${STACK_FILE} (or GIT_ENCRYPT_KEY_FILE)"
+[ -n "$VERIFY_PATH" ] || die "repository for verification not configured: set pcloud-mcp:gitVerifyRepo in ${STACK_FILE} (or GIT_VERIFY_PATH)"
+[ -n "$REGION" ] || die "region not configured: set aws:region in ${STACK_FILE} (or AWS_REGION)"
+
+# Temporary directory. Always removed on exit.
+readonly TMP="$(mktemp -d)"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------- 1. Read
+
+step "Reading the key: ${KEY_FILE}"
+[ -f "$KEY_FILE" ] || die "key file not found: ${KEY_FILE}"
+tr -d ' \t\r\n' < "$KEY_FILE" > "${TMP}/key"
+
+python3 - "$TMP" <<'PY'
+import pathlib, sys
+k = (pathlib.Path(sys.argv[1]) / "key").read_text()
+if len(k) != 64:
+    sys.exit(f"unexpected length ({len(k)} characters; it must be 64 hex characters)")
+try:
+    bytes.fromhex(k)
+except ValueError:
+    sys.exit("not valid hex")
+print("    Format: valid (64 hex characters = 32 bytes)")
+PY
+
+# ---------------------------------------------------------------- 2. Verify
+
+step "Verifying the key by decrypting a real file: ${VERIFY_PATH}"
+[ -f "$TOKEN_FILE" ] || die "pCloud token not found: ${TOKEN_FILE} (set-pcloud-token creates it)"
+
+# Get the download link. The token is passed from a file, not held in a variable
+curl -s -G "${API_HOST}/getfilelink" \
+  --data-urlencode "access_token@${TOKEN_FILE}" \
+  --data-urlencode "path=${VERIFY_PATH}" -o "${TMP}/link.json"
+
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+r = json.loads((d / "link.json").read_text())
+if r.get("result") != 0:
+    sys.exit(f"pCloud did not return a download link: result={r.get('result')} {r.get('error','')}")
+host = r["hosts"][0]
+if not (host == "pcloud.com" or host.endswith(".pcloud.com")):
+    sys.exit(f"unexpected host returned: {host}")
+(d / "url").write_text(f"https://{host}{r['path']}")
+PY
+
+curl -s "$(cat "${TMP}/url")" -o "${TMP}/cipher.bin"
+
+# nonce(12) + ciphertext + authentication tag(16). If the tag verifies, the key is correct. The content is not shown
+node - "$TMP" <<'JS'
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const path = require("node:path");
+const dir = process.argv[2];
+const key = Buffer.from(fs.readFileSync(path.join(dir, "key"), "utf8"), "hex");
+const data = fs.readFileSync(path.join(dir, "cipher.bin"));
+if (data.length < 12 + 16 + 1) {
+  console.error(`the fetched file is too short (${data.length} bytes)`);
+  process.exit(1);
+}
+const d = crypto.createDecipheriv("aes-256-gcm", key, data.subarray(0, 12));
+d.setAuthTag(data.subarray(data.length - 16));
+let plain;
+try {
+  plain = Buffer.concat([d.update(data.subarray(12, data.length - 16)), d.final()]);
+} catch {
+  console.error("decryption failed. The key is wrong, or the file format is not the expected one");
+  process.exit(1);
+}
+if (!plain.toString("utf8").startsWith("ref: ")) {
+  console.error("decryption succeeded, but the content is not in HEAD format (starting with ref: )");
+  process.exit(1);
+}
+console.log("    Decryption: succeeded (the authentication tag verified and the HEAD format was confirmed)");
+JS
+
+# ---------------------------------------------------------------- 3. Register
+
+step "Registering in Secrets Manager"
+
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+(d / "secret.json").write_text(json.dumps({"encrypt_key": (d / "key").read_text()}))
+PY
+
+secret_name="$( cd "$INFRA" && pulumi stack output --stack "$STACK" gitKeySecretName 2>/dev/null || echo "pcloud-mcp-${STACK}/git-encrypt-key" )"
+version="$(aws secretsmanager put-secret-value --region "$REGION" \
+  --secret-id "$secret_name" \
+  --secret-string "file://${TMP}/secret.json" \
+  --query VersionId --output text)"
+echo "    Registered in ${secret_name} (version ${version})"
+
+# Read the registered value back and check that it has the intended form
+aws secretsmanager get-secret-value --region "$REGION" --secret-id "$secret_name" \
+  --query SecretString --output text > "${TMP}/stored.json"
+python3 - "$TMP" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+stored = json.loads((d / "stored.json").read_text())["encrypt_key"]
+if stored != (d / "key").read_text():
+    sys.exit("the registered value does not match the original")
+print("    Read it back and confirmed that it matches")
+PY
+
+# ---------------------------------------------------------------- 4. Apply
+
+if [ "$deploy" = false ]; then
+  echo
+  echo "The Lambda was not replaced. To apply, run pulumi up in infra."
+  exit 0
+fi
+
+step "Replacing the Lambda execution environment"
+echo "    An execution environment holds the key for as long as it lives, so it has to be recreated"
+
+command -v pulumi >/dev/null || die "pulumi not found (use --no-deploy to register only)"
+cd "$INFRA"
+# Not a secret, so store it as plaintext. Without --plaintext, Pulumi refuses it based on a guess
+pulumi config set --stack "$STACK" --plaintext gitKeySetAt "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+deploy_stack "key" || exit 1
+
+echo
+echo "Done."
